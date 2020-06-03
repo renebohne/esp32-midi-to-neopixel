@@ -4,15 +4,17 @@
 #include <WiFiClient.h>
 #include <WiFiUdp.h>
 
+#define APPLEMIDI_INITIATOR
 #include <AppleMidi.h>
+USING_NAMESPACE_APPLEMIDI
+
 #include <NeoPixelBus.h>
 
 
-char ssid[] = "SSID"; //  your network SSID (name)
-char pass[] = "PASSWORD";    // your network password (use for WPA, or use as key for WEP)
+char ssid[] = "WIFI_SSID"; //  your network SSID (name)
+char pass[] = "WIFI_PASSWORD";    // your network password (use for WPA, or use as key for WEP)
 
 int show_debug = 1;
-
 
 /* Avoid these pins:
 ESP32 has 6 strapping pins:
@@ -30,19 +32,76 @@ ESP32 has 6 strapping pins:
 //int transistorstate = 0;
 
 // NEOPIXEL SETUP
-#define PIN            25
+#define PIN            22
 
-#define NUMPIXELS      60
+#define NUMPIXELS      19
 
 //C1
 #define LOWEST_NOTE   24
 
-NeoPixelBus<NeoGrbFeature, NeoEsp32Rmt800KbpsMethod> pixels (NUMPIXELS, PIN);
+
+#include <ETH.h>
+#include <ESPmDNS.h>
+
+static bool eth_connected = false;
+
+void WiFiEvent(WiFiEvent_t event)
+{
+  switch (event) {
+    case SYSTEM_EVENT_ETH_START:
+      Serial.println("ETH Started");
+      //set eth hostname here
+      ETH.setHostname("esp32-ethernet");
+      break;
+    case SYSTEM_EVENT_ETH_CONNECTED:
+      Serial.println("ETH Connected");
+      break;
+    case SYSTEM_EVENT_ETH_GOT_IP:
+      Serial.print("ETH MAC: ");
+      Serial.print(ETH.macAddress());
+      Serial.print(", IPv4: ");
+      Serial.print(ETH.localIP());
+      if (ETH.fullDuplex()) {
+        Serial.print(", FULL_DUPLEX");
+      }
+      Serial.print(", ");
+      Serial.print(ETH.linkSpeed());
+      Serial.println("Mbps");
+      eth_connected = true;
+      break;
+    case SYSTEM_EVENT_ETH_DISCONNECTED:
+      Serial.println("ETH Disconnected");
+      eth_connected = false;
+      break;
+    case SYSTEM_EVENT_ETH_STOP:
+      Serial.println("ETH Stopped");
+      eth_connected = false;
+      break;
+    default:
+      break;
+  }
+}
+
+bool ETH_startup()
+{
+  WiFi.onEvent(WiFiEvent);
+  ETH.begin();
+
+  Serial.println(F("Getting IP address..."));
+
+  while (!eth_connected)
+    delay(100);
+
+  return true;
+}
+
+NeoPixelBus<NeoGrbFeature, NeoEsp32Rmt0800KbpsMethod> pixels (NUMPIXELS, PIN);
 
 unsigned long t0 = millis();
 bool isConnected = false;
 
-APPLEMIDI_CREATE_INSTANCE(WiFiUDP, AppleMIDI); // see definition in AppleMidi_Defs.h
+APPLEMIDI_CREATE_INSTANCE(WiFiUDP, MIDI, "ESP32", DEFAULT_CONTROL_PORT);
+
 
 void setAllLeds(int v)
 {
@@ -60,22 +119,31 @@ void setAllLeds(int v)
 // Event handlers for incoming MIDI messages
 // ====================================================================================
 
-// -----------------------------------------------------------------------------
-// rtpMIDI session. Device connected
-// -----------------------------------------------------------------------------
-void OnAppleMidiConnected(uint32_t ssrc, char* name) {
-  isConnected  = true;
+void OnAppleMidiConnected(const ssrc_t & ssrc, const char* name) {
+  isConnected = true;
   Serial.print(F("Connected to session "));
   Serial.println(name);
 }
 
-// -----------------------------------------------------------------------------
-// rtpMIDI session. Device disconnected
-// -----------------------------------------------------------------------------
-void OnAppleMidiDisconnected(uint32_t ssrc) {
-  isConnected  = false;
+void OnAppleMidiDisconnected(const ssrc_t & ssrc) {
+  isConnected = false;
   Serial.println(F("Disconnected"));
 }
+
+void OnAppleMidiError(const ssrc_t& ssrc, int32_t err) {
+  Serial.print  (F("Exception "));
+  Serial.print  (err);
+  Serial.print  (F(" from ssrc 0x"));
+  Serial.println(ssrc, HEX);
+
+  switch (err)
+  {
+    case Exception::NoResponseFromConnectionRequestException:
+      Serial.println(F("xxx:yyy did't respond to the connection request. Check the address and port, and any firewall or router settings. (time)"));
+      break;
+  }
+}
+
 
 
 
@@ -165,6 +233,12 @@ void OnAppleMidiNoteOff(byte channel, byte note, byte velocity) {
 }
 
 
+void OnAppleMidiByte(const ssrc_t & ssrc, byte data) {
+  Serial.print(F("raw MIDI: "));
+  Serial.println(data);
+}
+
+
 
 // -----------------------------------------------------------------------------
 //
@@ -203,24 +277,27 @@ void setup()
 
 
   Serial.println(F("OK, now make sure you an rtpMIDI session that is Enabled"));
-  Serial.print(F("Add device named Arduino with Host/Port "));
+  Serial.print(F("Add device named ESP32 with Host/Port "));
   Serial.print(WiFi.localIP());
   Serial.println(F(":5004"));
-  Serial.println(F("Then press the Connect button"));
-  Serial.println(F("Then open a MIDI listener (eg MIDI-OX) and monitor incoming notes"));
 
-  // Create a session and wait for a remote host to connect to us
-  AppleMIDI.begin("test");
 
-  AppleMIDI.OnConnected(OnAppleMidiConnected);
-  AppleMIDI.OnDisconnected(OnAppleMidiDisconnected);
+  MDNS.begin(AppleMIDI.getName());
 
-  AppleMIDI.OnReceiveNoteOn(OnAppleMidiNoteOn);
-  AppleMIDI.OnReceiveNoteOff(OnAppleMidiNoteOff);
+  MIDI.begin(1); // listen on channel 1
 
-  AppleMIDI.OnReceiveControlChange(OnAppleMidiControlChange);
+  AppleMIDI.setHandleConnected(OnAppleMidiConnected);
+  AppleMIDI.setHandleDisconnected(OnAppleMidiDisconnected);
+  AppleMIDI.setHandleError(OnAppleMidiError);
 
-  //Serial.println(F("Sending NoteOn/Off of note 45, every second"));
+
+  MDNS.addService("apple-midi", "udp", AppleMIDI.getPort());
+  MDNS.addService("http", "tcp", 80);
+
+  MIDI.setHandleNoteOn(OnAppleMidiNoteOn);
+  MIDI.setHandleNoteOff(OnAppleMidiNoteOff);
+
+  AppleMIDI.setHandleReceivedMidi(OnAppleMidiByte);
 }
 
 // -----------------------------------------------------------------------------
@@ -229,7 +306,7 @@ void setup()
 void loop()
 {
   // Listen to incoming notes
-  AppleMIDI.run();
+ MIDI.read();
 
   // send a note every second
   // (dont cáll delay(1000) as it will stall the pipeline)
